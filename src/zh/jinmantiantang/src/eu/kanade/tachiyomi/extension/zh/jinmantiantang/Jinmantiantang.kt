@@ -492,7 +492,6 @@ class Jinmantiantang :
         open fun toUriPart() = vals[state].second
     }
 
-    // ---------- 设置界面 ----------
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val context = screen.context
 
@@ -504,11 +503,9 @@ class Jinmantiantang :
             setDefaultValue(true)
             setOnPreferenceChangeListener { _, newValue ->
                 if (newValue == false) {
-                    // 关闭开关时清除 Cookie
                     preferences.edit().remove(COOKIE_PREF).apply()
                     Toast.makeText(context, "已清除登录状态", Toast.LENGTH_SHORT).show()
                 } else {
-                    // 开启开关时，如果有用户名密码，可以尝试立即登录（可选）
                     val username = preferences.getString(USERNAME_PREF, "")!!
                     val password = preferences.getString(PASSWORD_PREF, "")!!
                     if (username.isNotBlank() && password.isNotBlank()) {
@@ -522,7 +519,6 @@ class Jinmantiantang :
             }
         }.let(screen::addPreference)
 
-        // 用户名
         EditTextPreference(context).apply {
             key = USERNAME_PREF
             title = "用户名"
@@ -530,7 +526,6 @@ class Jinmantiantang :
             setDefaultValue("")
         }.let(screen::addPreference)
 
-        // 密码
         EditTextPreference(context).apply {
             key = PASSWORD_PREF
             title = "密码"
@@ -538,7 +533,6 @@ class Jinmantiantang :
             setDefaultValue("")
         }.let(screen::addPreference)
 
-        // 原有的其他设置项（镜像、屏蔽词等）
         getPreferenceList(context, preferences, updateUrlInterceptor.isUpdated).forEach(screen::addPreference)
         screen.addRandomUAPreference()
     }
