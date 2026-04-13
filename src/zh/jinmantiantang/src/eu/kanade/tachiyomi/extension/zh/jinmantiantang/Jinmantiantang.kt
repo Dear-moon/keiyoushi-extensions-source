@@ -512,8 +512,6 @@ class Jinmantiantang :
                     val username = preferences.getString(USERNAME_PREF, "")!!
                     val password = preferences.getString(PASSWORD_PREF, "")!!
                     if (username.isNotBlank() && password.isNotBlank()) {
-                        // 注意：这里不能直接调用 client 中的 performLogin，因为拦截器可能还没准备好
-                        // 简单做法：清除 Cookie 后让下次请求自动登录
                         preferences.edit().remove(COOKIE_PREF).apply()
                         Toast.makeText(context, "已开启自动登录，下次访问需登录页面时将自动登录", Toast.LENGTH_SHORT).show()
                     } else {
