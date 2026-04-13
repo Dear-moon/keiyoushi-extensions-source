@@ -56,6 +56,10 @@ internal fun getPreferenceList(context: Context, preferences: SharedPreferences,
     },
 )
 
+// 扩展属性：获取用户名（用于收藏夹等需要用户名的场景）
+val SharedPreferences.username: String
+    get() = getString(USERNAME_PREF, "") ?: ""
+
 val SharedPreferences.baseUrl: String
     get() {
         val list = SITE_ENTRIES_ARRAY
@@ -64,6 +68,7 @@ val SharedPreferences.baseUrl: String
         return urlList.getOrNull(index - list.size) ?: list[0]
     }
 
+internal const val USERNAME_PREF = "username"
 internal const val BLOCK_PREF = "BLOCK_GENRES_LIST"
 
 internal const val MAINSITE_RATELIMIT_PREF = "mainSiteRateLimitPreference"

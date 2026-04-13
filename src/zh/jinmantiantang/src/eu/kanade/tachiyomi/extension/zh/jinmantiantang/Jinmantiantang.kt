@@ -1,8 +1,12 @@
 package eu.kanade.tachiyomi.extension.zh.jinmantiantang
 
 import android.util.Base64
+import android.widget.Toast
+import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
+import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.asObservableSuccess
 import eu.kanade.tachiyomi.network.interceptor.rateLimitHost
 import eu.kanade.tachiyomi.source.ConfigurableSource
@@ -18,7 +22,9 @@ import keiyoushi.lib.randomua.addRandomUAPreference
 import keiyoushi.lib.randomua.setRandomUserAgent
 import keiyoushi.utils.getPreferences
 import keiyoushi.utils.tryParse
+import okhttp3.FormBody
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -43,17 +49,105 @@ class Jinmantiantang :
 
     private val updateUrlInterceptor = UpdateUrlInterceptor(preferences)
 
+    // 自动登录开关的 key
+    private val autoLoginEnabled: Boolean
+        get() = preferences.getBoolean(AUTO_LOGIN_PREF, true)
+
+    // 认证拦截器：自动登录 + 添加 Cookie
+    private inner class AuthInterceptor : Interceptor {
+        override fun intercept(chain: Interceptor.Chain): Response {
+            val request = chain.request()
+            val url = request.url.toString()
+
+            // 判断是否需要登录的请求（收藏夹等）
+            val requiresAuth = url.contains("/user/") || url.contains("/favorite/")
+
+            if (requiresAuth && autoLoginEnabled) {
+                var cookies = preferences.getString(COOKIE_PREF, "")
+                if (cookies.isNullOrEmpty()) {
+                    // 自动登录
+                    val username = preferences.getString(USERNAME_PREF, "")!!
+                    val password = preferences.getString(PASSWORD_PREF, "")!!
+                    if (username.isNotBlank() && password.isNotBlank()) {
+                        cookies = performLogin(username, password)
+                        if (cookies != null) {
+                            preferences.edit().putString(COOKIE_PREF, cookies).apply()
+                        }
+                    }
+                }
+                if (!cookies.isNullOrEmpty()) {
+                    val newRequest = request.newBuilder()
+                        .header("Cookie", cookies)
+                        .build()
+                    val response = chain.proceed(newRequest)
+                    // 如果返回 401/403，可能是 Cookie 失效，清除并重试一次
+                    if (response.code == 401 || response.code == 403) {
+                        response.close()
+                        preferences.edit().remove(COOKIE_PREF).apply()
+                        val newCookies = performLogin(
+                            preferences.getString(USERNAME_PREF, "")!!,
+                            preferences.getString(PASSWORD_PREF, "")!!,
+                        )
+                        if (newCookies != null) {
+                            preferences.edit().putString(COOKIE_PREF, newCookies).apply()
+                            val retryRequest = request.newBuilder()
+                                .header("Cookie", newCookies)
+                                .build()
+                            return chain.proceed(retryRequest)
+                        }
+                    }
+                    return response
+                }
+            }
+            // 不需要登录或自动登录关闭，直接放行
+            return chain.proceed(request)
+        }
+
+        private fun performLogin(username: String, password: String): String? {
+            val loginUrl = "$baseUrl/login"
+            val formBody = FormBody.Builder()
+                .add("username", username)
+                .add("password", password)
+                .add("id_remember", "on")
+                .add("login_remember", "on")
+                .add("submit_login", "")
+                .build()
+            val request = POST(loginUrl, headers, formBody)
+            // 使用临时 client 避免递归
+            val tempClient = client.newBuilder()
+                .interceptors().filterNot { it is AuthInterceptor }
+                .let { OkHttpClient.Builder().apply { interceptors().addAll(it) } }
+                .build()
+            val response = tempClient.newCall(request).execute()
+            return if (response.isSuccessful) {
+                extractCookiesFromResponse(response)
+            } else {
+                null
+            }
+        }
+
+        private fun extractCookiesFromResponse(response: Response): String {
+            val cookies = mutableListOf<String>()
+            for (header in response.headers("Set-Cookie")) {
+                val cookiePart = header.substringBefore(";")
+                cookies.add(cookiePart)
+            }
+            return cookies.joinToString("; ")
+        }
+    }
+
     // 处理URL请求
     override val client: OkHttpClient = network.cloudflareClient
         .newBuilder()
-        // Add rate limit to fix manga thumbnail load failure
         .rateLimitHost(
             baseUrl.toHttpUrl(),
             preferences.getString(MAINSITE_RATELIMIT_PREF, MAINSITE_RATELIMIT_PREF_DEFAULT)!!.toInt(),
             preferences.getString(MAINSITE_RATELIMIT_PERIOD, MAINSITE_RATELIMIT_PERIOD_DEFAULT)!!.toLong(),
         )
         .apply { interceptors().add(0, updateUrlInterceptor) }
-        .addInterceptor(ScrambledImageInterceptor).build()
+        .addInterceptor(AuthInterceptor()) // 使用认证拦截器
+        .addInterceptor(ScrambledImageInterceptor)
+        .build()
 
     // 添加额外的header增加规避Cloudflare可能性
     override fun headersBuilder() = super.headersBuilder()
@@ -126,9 +220,7 @@ class Jinmantiantang :
         var params = filters.filterIsInstance<UriPartFilter>().joinToString("") { it.toUriPart() }
 
         val url = if (query != "" && !query.contains("-")) {
-            // 禁漫天堂特有搜索方式: A +B --> A and B, A B --> A or B
             var newQuery = query.replace("+", "%2B").replace(" ", "+")
-            // remove illegal param
             params = params.substringAfter("?")
             if (params.contains("search_query")) {
                 val keyword = params.substringBefore("&").substringAfter("=")
@@ -141,7 +233,6 @@ class Jinmantiantang :
             if (query == "") {
                 "$baseUrl$params&page=$page"
             } else {
-                // 在搜索栏的关键词前添加-号来实现对筛选结果的过滤, 像 "-YAOI -扶他 -毛絨絨 -獵奇", 注意此时搜索功能不可用.
                 val removedGenres = query.split(" ").filter { it.startsWith("-") }.joinToString("+") { it.removePrefix("-") }
                 "$baseUrl$params&page=$page&screen=$removedGenres"
             }
@@ -159,7 +250,6 @@ class Jinmantiantang :
     }
 
     // 漫画详情
-
     private fun mangaDetailsResolve(response: Response): Document {
         val document = response.asJsoup()
         val scripts =
@@ -170,13 +260,8 @@ class Jinmantiantang :
 
             jsCode.lines().forEach { line ->
                 val trimmedLine = line.trim()
-                // html = base64DecodeUtf8("...")
-                if (trimmedLine.startsWith("const html") || trimmedLine.startsWith("let html") || trimmedLine.startsWith(
-                        "var html",
-                    )
-                ) {
-                    val start =
-                        trimmedLine.indexOf("base64DecodeUtf8(\"") + "base64DecodeUtf8(\"".length
+                if (trimmedLine.startsWith("const html") || trimmedLine.startsWith("let html") || trimmedLine.startsWith("var html")) {
+                    val start = trimmedLine.indexOf("base64DecodeUtf8(\"") + "base64DecodeUtf8(\"".length
                     val end = trimmedLine.indexOf("\");", start)
                     if (start > 0 && end > start) {
                         val html = Base64.decode(trimmedLine.substring(start, end), Base64.DEFAULT)
@@ -195,13 +280,9 @@ class Jinmantiantang :
 
     override fun mangaDetailsParse(document: Document): SManga = SManga.create().apply {
         title = document.selectFirst("h1")!!.text()
-        // keep thumbnail_url same as the one in popularMangaFromElement()
         thumbnail_url = document.selectFirst(".thumb-overlay > img")!!.extractThumbnailUrl().substringBeforeLast('.') + "_3x4.jpg"
         author = selectAuthor(document)
         genre = selectDetailsStatusAndGenre(document, 0).trim().split(" ").joinToString(", ")
-
-        // When the index passed by the "selectDetailsStatusAndGenre(document: Document, index: Int)" index is 1,
-        // it will definitely return a String type of 0, 1 or 2. This warning can be ignored
         status = selectDetailsStatusAndGenre(document, 1).trim().toInt()
         description = document.selectFirst("#intro-block .p-t-5.p-b-5")!!.text().substringAfter("敘述：").trim()
     }
@@ -215,44 +296,26 @@ class Jinmantiantang :
         else -> ""
     }
 
-    // 查询作者信息
     private fun selectAuthor(document: Document): String {
         val element = document.select("div.panel-body div.tag-block")[3]
         return element.select(".btn-primary").joinToString { it.text() }
     }
 
-    // 查询漫画状态和类别信息
     private fun selectDetailsStatusAndGenre(document: Document, index: Int): String {
         var status = "0"
         var genre = ""
         if (document.select("span[itemprop=genre] a").size == 0) {
-            return if (index == 1) {
-                status
-            } else {
-                genre
-            }
+            return if (index == 1) status else genre
         }
         val elements: Elements = document.select("span[itemprop=genre]").first()!!.select("a")
         for (value in elements) {
             when (val vote: String = value.select("a").text()) {
-                "連載中" -> {
-                    status = "1"
-                }
-
-                "完結" -> {
-                    status = "2"
-                }
-
-                else -> {
-                    genre = "$genre$vote "
-                }
+                "連載中" -> status = "1"
+                "完結" -> status = "2"
+                else -> genre = "$genre$vote "
             }
         }
-        return if (index == 1) {
-            status
-        } else {
-            genre
-        }
+        return if (index == 1) status else genre
     }
 
     // 漫画章节信息
@@ -299,15 +362,12 @@ class Jinmantiantang :
                 else -> internalParse(client.newCall(GET(next.attr("abs:href"), headers)).execute().asJsoup(), pages)
             }
         }
-
         return internalParse(document, mutableListOf())
     }
 
     override fun imageUrlParse(document: Document): String = throw UnsupportedOperationException()
 
     // Filters
-    // 按照类别信息进行检索
-
     override fun getFilterList() = FilterList(
         CategoryGroup(),
         SortFilter(),
@@ -315,12 +375,13 @@ class Jinmantiantang :
         TypeFilter(),
     )
 
-    private class CategoryGroup :
+    private inner class CategoryGroup :
         UriPartFilter(
             "按类型",
             arrayOf(
                 Pair("全部", "/albums?"),
                 Pair("其他", "/albums/another?"),
+                Pair("收藏夹", "/user/${preferences.getString(USERNAME_PREF, "")}/favorite/albums?"),
                 Pair("同人", "/albums/doujin?"),
                 Pair("韩漫", "/albums/hanman?"),
                 Pair("美漫", "/albums/meiman?"),
@@ -328,13 +389,10 @@ class Jinmantiantang :
                 Pair("单本", "/albums/single?"),
                 Pair("汉化", "/albums/doujin/sub/chinese?"),
                 Pair("日语", "/albums/doujin/sub/japanese?"),
-                Pair("汉化", "/albums/doujin/sub/chinese?"),
                 Pair("Cosplay", "/albums/doujin/sub/cosplay?"),
                 Pair("CG图集", "/albums/doujin/sub/CG?"),
-
                 Pair("P站", "/search/photos?search_query=PIXIV&"),
                 Pair("3D", "/search/photos?search_query=3D&"),
-
                 Pair("剧情", "/search/photos?search_query=劇情&"),
                 Pair("校园", "/search/photos?search_query=校園&"),
                 Pair("纯爱", "/search/photos?search_query=純愛&"),
@@ -350,7 +408,6 @@ class Jinmantiantang :
                 Pair("痴女", "/search/photos?search_query=癡女&"),
                 Pair("全彩", "/search/photos?search_query=全彩&"),
                 Pair("女性向", "/search/photos?search_query=女性向&"),
-
                 Pair("萝莉", "/search/photos?search_query=蘿莉&"),
                 Pair("御姐", "/search/photos?search_query=御姐&"),
                 Pair("熟女", "/search/photos?search_query=熟女&"),
@@ -367,7 +424,6 @@ class Jinmantiantang :
                 Pair("连裤袜", "/search/photos?search_query=連褲襪&"),
                 Pair("制服", "/search/photos?search_query=制服&"),
                 Pair("兔女郎", "/search/photos?search_query=兔女郎&"),
-
                 Pair("群交", "/search/photos?search_query=群交&"),
                 Pair("足交", "/search/photos?search_query=足交&"),
                 Pair("SM", "/search/photos?search_query=SM&"),
@@ -384,7 +440,6 @@ class Jinmantiantang :
                 Pair("兽交", "/search/photos?search_query=獸交&"),
                 Pair("亚人", "/search/photos?search_query=亞人&"),
                 Pair("魔物", "/search/photos?search_query=魔物&"),
-
                 Pair("CG集", "/search/photos?search_query=CG集&"),
                 Pair("重口", "/search/photos?search_query=重口&"),
                 Pair("猎奇", "/search/photos?search_query=獵奇&"),
@@ -429,12 +484,6 @@ class Jinmantiantang :
             ),
         )
 
-    /**
-     *创建选择过滤器的类。 下拉菜单中的每个条目都有一个名称和一个显示名称。
-     *如果选择了一个条目，它将作为查询参数附加到URI的末尾。
-     *如果将firstIsUnspecified设置为true，则如果选择了第一个条目，则URI不会附加任何内容。
-     */
-    // vals: <name, display>
     private open class UriPartFilter(
         displayName: String,
         val vals: Array<Pair<String, String>>,
@@ -443,12 +492,65 @@ class Jinmantiantang :
         open fun toUriPart() = vals[state].second
     }
 
+    // ---------- 设置界面 ----------
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        getPreferenceList(screen.context, preferences, updateUrlInterceptor.isUpdated).forEach(screen::addPreference)
+        val context = screen.context
+
+        // 自动登录开关
+        SwitchPreferenceCompat(context).apply {
+            key = AUTO_LOGIN_PREF
+            title = "自动登录"
+            summary = "开启后，访问需要登录的页面（如收藏夹）时会自动使用下方账号登录"
+            setDefaultValue(true)
+            setOnPreferenceChangeListener { _, newValue ->
+                if (newValue == false) {
+                    // 关闭开关时清除 Cookie
+                    preferences.edit().remove(COOKIE_PREF).apply()
+                    Toast.makeText(context, "已清除登录状态", Toast.LENGTH_SHORT).show()
+                } else {
+                    // 开启开关时，如果有用户名密码，可以尝试立即登录（可选）
+                    val username = preferences.getString(USERNAME_PREF, "")!!
+                    val password = preferences.getString(PASSWORD_PREF, "")!!
+                    if (username.isNotBlank() && password.isNotBlank()) {
+                        // 注意：这里不能直接调用 client 中的 performLogin，因为拦截器可能还没准备好
+                        // 简单做法：清除 Cookie 后让下次请求自动登录
+                        preferences.edit().remove(COOKIE_PREF).apply()
+                        Toast.makeText(context, "已开启自动登录，下次访问需登录页面时将自动登录", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(context, "请先填写用户名和密码", Toast.LENGTH_SHORT).show()
+                    }
+                }
+                true
+            }
+        }.let(screen::addPreference)
+
+        // 用户名
+        EditTextPreference(context).apply {
+            key = USERNAME_PREF
+            title = "用户名"
+            summary = "用于自动登录"
+            setDefaultValue("")
+        }.let(screen::addPreference)
+
+        // 密码
+        EditTextPreference(context).apply {
+            key = PASSWORD_PREF
+            title = "密码"
+            summary = "仅用于获取 Cookie，不会明文存储"
+            setDefaultValue("")
+        }.let(screen::addPreference)
+
+        // 原有的其他设置项（镜像、屏蔽词等）
+        getPreferenceList(context, preferences, updateUrlInterceptor.isUpdated).forEach(screen::addPreference)
         screen.addRandomUAPreference()
     }
+
     companion object {
         private const val PREFIX_ID_SEARCH_NO_COLON = "JM"
         const val PREFIX_ID_SEARCH = "$PREFIX_ID_SEARCH_NO_COLON:"
+        private const val USERNAME_PREF = "username"
+        private const val PASSWORD_PREF = "password"
+        private const val COOKIE_PREF = "auth_cookie"
+        private const val AUTO_LOGIN_PREF = "auto_login"
     }
 }
