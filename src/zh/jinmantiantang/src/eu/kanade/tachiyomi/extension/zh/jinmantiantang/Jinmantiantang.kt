@@ -49,90 +49,20 @@ class Jinmantiantang :
 
     private val updateUrlInterceptor = UpdateUrlInterceptor(preferences)
 
-    // 自动登录开关的 key
-    private val autoLoginEnabled: Boolean
-        get() = preferences.getBoolean(AUTO_LOGIN_PREF, true)
-
-    // 认证拦截器：自动登录 + 添加 Cookie
-    private inner class AuthInterceptor : Interceptor {
+    // Cookie 添加拦截器
+    private inner class CookieInterceptor : Interceptor {
         override fun intercept(chain: Interceptor.Chain): Response {
             val request = chain.request()
-            val url = request.url.toString()
-
-            // 判断是否需要登录的请求（收藏夹等）
-            val requiresAuth = url.contains("/user/") || url.contains("/favorite/")
-
-            if (requiresAuth && autoLoginEnabled) {
-                var cookies = preferences.getString(COOKIE_PREF, "")
-                if (cookies.isNullOrEmpty()) {
-                    // 自动登录
-                    val username = preferences.getString(USERNAME_PREF, "")!!
-                    val password = preferences.getString(PASSWORD_PREF, "")!!
-                    if (username.isNotBlank() && password.isNotBlank()) {
-                        cookies = performLogin(username, password)
-                        if (cookies != null) {
-                            preferences.edit().putString(COOKIE_PREF, cookies).apply()
-                        }
-                    }
-                }
-                if (!cookies.isNullOrEmpty()) {
-                    val newRequest = request.newBuilder()
-                        .header("Cookie", cookies)
-                        .build()
-                    val response = chain.proceed(newRequest)
-                    // 如果返回 401/403，可能是 Cookie 失效，清除并重试一次
-                    if (response.code == 401 || response.code == 403) {
-                        response.close()
-                        preferences.edit().remove(COOKIE_PREF).apply()
-                        val newCookies = performLogin(
-                            preferences.getString(USERNAME_PREF, "")!!,
-                            preferences.getString(PASSWORD_PREF, "")!!,
-                        )
-                        if (newCookies != null) {
-                            preferences.edit().putString(COOKIE_PREF, newCookies).apply()
-                            val retryRequest = request.newBuilder()
-                                .header("Cookie", newCookies)
-                                .build()
-                            return chain.proceed(retryRequest)
-                        }
-                    }
-                    return response
-                }
-            }
-            // 不需要登录或自动登录关闭，直接放行
-            return chain.proceed(request)
-        }
-
-        private fun performLogin(username: String, password: String): String? {
-            val loginUrl = "$baseUrl/login"
-            val formBody = FormBody.Builder()
-                .add("username", username)
-                .add("password", password)
-                .add("id_remember", "on")
-                .add("login_remember", "on")
-                .add("submit_login", "")
-                .build()
-            val request = POST(loginUrl, headers, formBody)
-            // 使用临时 client 避免递归
-            val tempClient = client.newBuilder()
-                .interceptors().filterNot { it is AuthInterceptor }
-                .let { OkHttpClient.Builder().apply { interceptors().addAll(it) } }
-                .build()
-            val response = tempClient.newCall(request).execute()
-            return if (response.isSuccessful) {
-                extractCookiesFromResponse(response)
+            val isLoginEnabled = preferences.getBoolean(ENABLE_LOGIN_PREF, false)
+            val cookies = if (isLoginEnabled) preferences.getString(COOKIE_PREF, "") else null
+            val newRequest = if (!cookies.isNullOrEmpty()) {
+                request.newBuilder()
+                    .header("Cookie", cookies)
+                    .build()
             } else {
-                null
+                request
             }
-        }
-
-        private fun extractCookiesFromResponse(response: Response): String {
-            val cookies = mutableListOf<String>()
-            for (header in response.headers("Set-Cookie")) {
-                val cookiePart = header.substringBefore(";")
-                cookies.add(cookiePart)
-            }
-            return cookies.joinToString("; ")
+            return chain.proceed(newRequest)
         }
     }
 
@@ -145,7 +75,7 @@ class Jinmantiantang :
             preferences.getString(MAINSITE_RATELIMIT_PERIOD, MAINSITE_RATELIMIT_PERIOD_DEFAULT)!!.toLong(),
         )
         .apply { interceptors().add(0, updateUrlInterceptor) }
-        .addInterceptor(AuthInterceptor()) // 使用认证拦截器
+        .addInterceptor(CookieInterceptor())
         .addInterceptor(ScrambledImageInterceptor)
         .build()
 
@@ -381,7 +311,7 @@ class Jinmantiantang :
             arrayOf(
                 Pair("全部", "/albums?"),
                 Pair("其他", "/albums/another?"),
-                Pair("收藏夹", "/user/${preferences.getString(USERNAME_PREF, "")}/favorite/albums?"),
+                Pair("收藏夹", "/user/${getUsername()}/favorite/albums?"),
                 Pair("同人", "/albums/doujin?"),
                 Pair("韩漫", "/albums/hanman?"),
                 Pair("美漫", "/albums/meiman?"),
@@ -492,47 +422,149 @@ class Jinmantiantang :
         open fun toUriPart() = vals[state].second
     }
 
+    // ---------- 登录相关 ----------
+    private fun getUsername(): String = preferences.getString(USERNAME_PREF, "") ?: ""
+
+    // 执行登录（同步网络请求，因为是在设置线程中调用，可以短暂阻塞）
+    private fun performLogin(username: String, password: String): String? {
+        val loginUrl = "$baseUrl/login"
+        val formBody = FormBody.Builder()
+            .add("username", username)
+            .add("password", password)
+            .add("id_remember", "on")
+            .add("login_remember", "on")
+            .add("submit_login", "")
+            .build()
+        val request = POST(loginUrl, headers, formBody)
+        // 使用临时 client 避免拦截器干扰
+        val tempClient = client.newBuilder()
+            .interceptors().filterNot { it is CookieInterceptor }
+            .let { OkHttpClient.Builder().apply { interceptors().addAll(it) } }
+            .build()
+        val response = tempClient.newCall(request).execute()
+        return if (response.isSuccessful) {
+            extractCookiesFromResponse(response)
+        } else {
+            null
+        }
+    }
+
+    private fun extractCookiesFromResponse(response: Response): String {
+        val cookies = mutableListOf<String>()
+        for (header in response.headers("Set-Cookie")) {
+            val cookiePart = header.substringBefore(";")
+            cookies.add(cookiePart)
+        }
+        return cookies.joinToString("; ")
+    }
+
+    // 更新开关的 summary 显示登录状态
+    private fun updateSwitchSummary(switchPref: SwitchPreferenceCompat) {
+        val isLoginEnabled = switchPref.isChecked
+        val cookies = preferences.getString(COOKIE_PREF, "")
+        val username = getUsername()
+        val favoriteUrl = "/user/$username/favorite/albums?"
+
+        val summary = if (isLoginEnabled && !cookies.isNullOrEmpty()) {
+            val cookieDisplay = if (cookies.length > 16) {
+                cookies.substring(0, 12) + "..." + cookies.substring(cookies.length - 4)
+            } else {
+                cookies
+            }
+            "已登入($cookieDisplay)\n收藏夹URL: $favoriteUrl"
+        } else {
+            "未登入"
+        }
+        switchPref.summary = summary
+    }
+
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val context = screen.context
-
-        // 自动登录开关
-        SwitchPreferenceCompat(context).apply {
-            key = AUTO_LOGIN_PREF
-            title = "自动登录"
-            summary = "开启后，访问需要登录的页面（如收藏夹）时会自动使用下方账号登录"
-            setDefaultValue(true)
-            setOnPreferenceChangeListener { _, newValue ->
-                if (newValue == false) {
+        
+        EditTextPreference(context).apply {
+            key = USERNAME_PREF
+            title = "用户名"
+            summary = "用于登录禁漫天堂"
+            setDefaultValue("")
+            setOnPreferenceChangeListener { _, _ ->
+                // 用户名改变时，如果开关是开启状态，则清除旧 Cookie，提示重新登录
+                if (preferences.getBoolean(ENABLE_LOGIN_PREF, false)) {
                     preferences.edit().remove(COOKIE_PREF).apply()
-                    Toast.makeText(context, "已清除登录状态", Toast.LENGTH_SHORT).show()
-                } else {
-                    val username = preferences.getString(USERNAME_PREF, "")!!
-                    val password = preferences.getString(PASSWORD_PREF, "")!!
-                    if (username.isNotBlank() && password.isNotBlank()) {
-                        preferences.edit().remove(COOKIE_PREF).apply()
-                        Toast.makeText(context, "已开启自动登录，下次访问需登录页面时将自动登录", Toast.LENGTH_SHORT).show()
-                    } else {
-                        Toast.makeText(context, "请先填写用户名和密码", Toast.LENGTH_SHORT).show()
-                    }
+                    Toast.makeText(context, "用户名已更改，请重新开启登录开关", Toast.LENGTH_SHORT).show()
+                }
+                true
+            }
+        }.let(screen::addPreference)
+        
+        EditTextPreference(context).apply {
+            key = PASSWORD_PREF
+            title = "密码"
+            summary = "仅用于登录获取 Cookie"
+            setDefaultValue("")
+            setOnPreferenceChangeListener { _, _ ->
+                if (preferences.getBoolean(ENABLE_LOGIN_PREF, false)) {
+                    preferences.edit().remove(COOKIE_PREF).apply()
+                    Toast.makeText(context, "密码已更改，请重新开启登录开关", Toast.LENGTH_SHORT).show()
                 }
                 true
             }
         }.let(screen::addPreference)
 
-        EditTextPreference(context).apply {
-            key = USERNAME_PREF
-            title = "用户名"
-            summary = "用于自动登录"
-            setDefaultValue("")
-        }.let(screen::addPreference)
+        // 启用登录状态的开关
+        val switchLogin = SwitchPreferenceCompat(context).apply {
+            key = ENABLE_LOGIN_PREF
+            title = "启用登入状态浏览"
+            setDefaultValue(false)
+        }
+        screen.addPreference(switchLogin)
 
-        EditTextPreference(context).apply {
-            key = PASSWORD_PREF
-            title = "密码"
-            summary = "仅用于获取 Cookie，不会明文存储"
-            setDefaultValue("")
-        }.let(screen::addPreference)
+        // 初始化 summary
+        updateSwitchSummary(switchLogin)
 
+        // 监听开关变化
+        switchLogin.setOnPreferenceChangeListener { _, newValue ->
+            val isEnable = newValue as Boolean
+            if (isEnable) {
+                // 开启开关：尝试登录
+                val username = preferences.getString(USERNAME_PREF, "")!!
+                val password = preferences.getString(PASSWORD_PREF, "")!!
+                if (username.isBlank() || password.isBlank()) {
+                    Toast.makeText(context, "请先填写用户名和密码", Toast.LENGTH_LONG).show()
+                    // 保持开关关闭
+                    return@setOnPreferenceChangeListener false
+                }
+                // 在后台线程登录，避免阻塞 UI
+                Thread {
+                    val cookies = performLogin(username, password)
+                    if (cookies != null) {
+                        preferences.edit().putString(COOKIE_PREF, cookies).apply()
+                        // 更新 UI 显示
+                        (context as? android.app.Activity)?.runOnUiThread {
+                            updateSwitchSummary(switchLogin)
+                            Toast.makeText(context, "登录成功", Toast.LENGTH_SHORT).show()
+                        }
+                        // 开关保持开启
+                        (switchLogin as SwitchPreferenceCompat).isChecked = true
+                    } else {
+                        (context as? android.app.Activity)?.runOnUiThread {
+                            Toast.makeText(context, "登录失败，请检查用户名和密码", Toast.LENGTH_LONG).show()
+                            updateSwitchSummary(switchLogin)
+                        }
+                        // 登录失败，回滚开关状态
+                        (switchLogin as SwitchPreferenceCompat).isChecked = false
+                    }
+                }.start()
+                // 返回 true 表示接受状态变化（实际状态会在登录成功后设置，这里先允许变化再异步修正）
+                true
+            } else {
+                // 关闭开关：清除 Cookie
+                preferences.edit().remove(COOKIE_PREF).apply()
+                updateSwitchSummary(switchLogin)
+                Toast.makeText(context, "已退出登录", Toast.LENGTH_SHORT).show()
+                true
+            }
+        }
+        
         getPreferenceList(context, preferences, updateUrlInterceptor.isUpdated).forEach(screen::addPreference)
         screen.addRandomUAPreference()
     }
@@ -543,6 +575,6 @@ class Jinmantiantang :
         private const val USERNAME_PREF = "username"
         private const val PASSWORD_PREF = "password"
         private const val COOKIE_PREF = "auth_cookie"
-        private const val AUTO_LOGIN_PREF = "auto_login"
+        private const val ENABLE_LOGIN_PREF = "enable_login"
     }
 }
