@@ -1,5 +1,7 @@
 package eu.kanade.tachiyomi.extension.zh.jinmantiantang
 
+import android.content.Context
+import android.content.SharedPreferences
 import android.util.Base64
 import android.widget.Toast
 import androidx.preference.EditTextPreference
@@ -84,31 +86,42 @@ class Jinmantiantang :
         .set("Referer", "$baseUrl/")
         .setRandomUserAgent()
 
-    // 点击量排序(人气)
-    override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/albums?o=mv&page=$page", headers)
-
-    override fun popularMangaNextPageSelector(): String = "a.prevnext"
+    // ---------- 普通列表选择器 ----------
     override fun popularMangaSelector(): String = "div.list-col > div.p-b-15:not([data-group])"
+    override fun popularMangaNextPageSelector(): String = "a.prevnext"
+    override fun popularMangaFromElement(element: Element): SManga = parseNormalMangaItem(element)
 
-    private fun List<SManga>.filterGenre(): List<SManga> {
-        val removedGenres = preferences.getString(BLOCK_PREF, "")!!.substringBefore("//").trim()
-        if (removedGenres.isEmpty()) return this
-        val removedList = removedGenres.lowercase().split(' ')
-        return this.filterNot { manga ->
-            manga.genre.orEmpty().lowercase().split(", ").any { removedList.contains(it) }
+    override fun latestUpdatesSelector(): String = popularMangaSelector()
+    override fun latestUpdatesNextPageSelector(): String = popularMangaNextPageSelector()
+    override fun latestUpdatesFromElement(element: Element): SManga = popularMangaFromElement(element)
+
+    override fun searchMangaSelector(): String = popularMangaSelector()
+    override fun searchMangaNextPageSelector(): String = popularMangaNextPageSelector()
+    override fun searchMangaFromElement(element: Element): SManga = popularMangaFromElement(element)
+
+    // ---------- 收藏夹专用选择器和解析 ----------
+    private fun favoriteMangaSelector(): String = "div[id^='favorites_album_']"
+
+    private fun favoriteMangaFromElement(element: Element): SManga = SManga.create().apply {
+        val link = element.selectFirst("a[href^='/album/']")
+        if (link != null) {
+            setUrlWithoutDomain(link.attr("href"))
+            title = element.selectFirst(".video-title")?.text() ?: ""
+            val img = element.selectFirst(".thumb-overlay img")
+            thumbnail_url = when {
+                img != null && img.hasAttr("data-original") -> img.attr("data-original")
+                img != null && img.hasAttr("src") -> img.attr("src")
+                else -> ""
+            }.substringBeforeLast('?')
+        } else {
+            title = "Unknown"
         }
+        author = ""
+        genre = ""
     }
 
-    override fun popularMangaFromElement(element: Element): SManga = SManga.create().apply {
-        val children = element.children()
-        if (children[0].tagName() == "a") children.removeFirst()
-        title = children[1].text()
-        setUrlWithoutDomain(children[0].selectFirst("a")!!.attr("href"))
-        val img = children[0].selectFirst("img")!!
-        thumbnail_url = img.extractThumbnailUrl().substringBeforeLast('?')
-        author = children[2].select("a").joinToString(", ") { it.text() }
-        genre = children[3].select("a").joinToString(", ") { it.text() }
-    }
+    // ---------- 点击量排序(人气) ----------
+    override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/albums?o=mv&page=$page", headers)
 
     override fun popularMangaParse(response: Response): MangasPage {
         val page = super.popularMangaParse(response)
@@ -118,13 +131,31 @@ class Jinmantiantang :
     // 最新排序
     override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/albums?o=mr&page=$page", headers)
 
-    override fun latestUpdatesNextPageSelector(): String = popularMangaNextPageSelector()
-    override fun latestUpdatesSelector(): String = popularMangaSelector()
-    override fun latestUpdatesFromElement(element: Element): SManga = popularMangaFromElement(element)
-
     override fun latestUpdatesParse(response: Response): MangasPage {
         val page = super.latestUpdatesParse(response)
         return MangasPage(page.mangas.filterGenre(), page.hasNextPage)
+    }
+
+    // 屏蔽词过滤（通用）
+    private fun List<SManga>.filterGenre(): List<SManga> {
+        val removedGenres = preferences.getString(BLOCK_PREF, "")!!.substringBefore("//").trim()
+        if (removedGenres.isEmpty()) return this
+        val removedList = removedGenres.lowercase().split(' ')
+        return this.filterNot { manga ->
+            manga.genre.orEmpty().lowercase().split(", ").any { removedList.contains(it) }
+        }
+    }
+
+    // 普通漫画项解析
+    private fun parseNormalMangaItem(element: Element): SManga = SManga.create().apply {
+        val children = element.children()
+        if (children[0].tagName() == "a") children.removeFirst()
+        title = children[1].text()
+        setUrlWithoutDomain(children[0].selectFirst("a")!!.attr("href"))
+        val img = children[0].selectFirst("img")!!
+        thumbnail_url = img.extractThumbnailUrl().substringBeforeLast('?')
+        author = children[2].select("a").joinToString(", ") { it.text() }
+        genre = children[3].select("a").joinToString(", ") { it.text() }
     }
 
     // For JinmantiantangUrlActivity
@@ -145,8 +176,19 @@ class Jinmantiantang :
         super.fetchSearchManga(page, query, filters)
     }
 
-    // 查询信息
+    // 搜索/筛选请求
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
+        val favoritesFilter = filters.filterIsInstance<FavoritesFilter>().firstOrNull()
+        if (favoritesFilter?.isEnabled() == true) {
+            val username = getUsername()
+            if (username.isBlank()) {
+                throw Exception("请先在设置中填写用户名")
+            }
+            val url = "$baseUrl/user/$username/favorite/albums?page=$page"
+            return GET(url, headers)
+        }
+
+        // 非收藏夹模式
         var params = filters.filterIsInstance<UriPartFilter>().joinToString("") { it.toUriPart() }
 
         val url = if (query != "" && !query.contains("-")) {
@@ -161,7 +203,9 @@ class Jinmantiantang :
         } else {
             params = if (params == "") "/albums?" else params
             if (query == "") {
-                "$baseUrl$params&page=$page"
+                val base = "$baseUrl$params"
+                val separator = if (params.contains("?")) "&" else "?"
+                "$base${separator}page=$page"
             } else {
                 val removedGenres = query.split(" ").filter { it.startsWith("-") }.joinToString("+") { it.removePrefix("-") }
                 "$baseUrl$params&page=$page&screen=$removedGenres"
@@ -170,13 +214,19 @@ class Jinmantiantang :
         return GET(url, headers)
     }
 
-    override fun searchMangaNextPageSelector(): String = popularMangaNextPageSelector()
-    override fun searchMangaSelector(): String = popularMangaSelector()
-    override fun searchMangaFromElement(element: Element): SManga = popularMangaFromElement(element)
-
     override fun searchMangaParse(response: Response): MangasPage {
-        val page = super.searchMangaParse(response)
-        return MangasPage(page.mangas.filterGenre(), page.hasNextPage)
+        val doc = response.asJsoup()
+        val isFavorite = response.request.url.toString().contains("/favorite/albums")
+
+        val mangas = if (isFavorite) {
+            val elements = doc.select(favoriteMangaSelector())
+            elements.map { favoriteMangaFromElement(it) }
+        } else {
+            val elements = doc.select(popularMangaSelector())
+            elements.map { parseNormalMangaItem(it) }
+        }
+        val hasNextPage = doc.select(popularMangaNextPageSelector()).isNotEmpty()
+        return MangasPage(mangas.filterGenre(), hasNextPage)
     }
 
     // 漫画详情
@@ -297,13 +347,20 @@ class Jinmantiantang :
 
     override fun imageUrlParse(document: Document): String = throw UnsupportedOperationException()
 
-    // Filters
+    // ---------- 筛选器 ----------
     override fun getFilterList() = FilterList(
+        FavoritesFilter(),
+        Filter.Separator(),
         CategoryGroup(),
         SortFilter(),
         TimeFilter(),
         TypeFilter(),
     )
+
+    private class FavoritesFilter :
+        Filter.Select<String>("收藏夹", arrayOf("关闭", "启用"), 0) {
+        fun isEnabled() = state == 1
+    }
 
     private inner class CategoryGroup :
         UriPartFilter(
@@ -311,7 +368,6 @@ class Jinmantiantang :
             arrayOf(
                 Pair("全部", "/albums?"),
                 Pair("其他", "/albums/another?"),
-                Pair("收藏夹", "/user/${getUsername()}/favorite/albums?"),
                 Pair("同人", "/albums/doujin?"),
                 Pair("韩漫", "/albums/hanman?"),
                 Pair("美漫", "/albums/meiman?"),
@@ -425,7 +481,6 @@ class Jinmantiantang :
     // ---------- 登录相关 ----------
     private fun getUsername(): String = preferences.getString(USERNAME_PREF, "") ?: ""
 
-    // 执行登录（同步网络请求，因为是在设置线程中调用，可以短暂阻塞）
     private fun performLogin(username: String, password: String): String? {
         val loginUrl = "$baseUrl/login"
         val formBody = FormBody.Builder()
@@ -436,7 +491,6 @@ class Jinmantiantang :
             .add("submit_login", "")
             .build()
         val request = POST(loginUrl, headers, formBody)
-        // 使用临时 client 避免拦截器干扰
         val tempClient = client.newBuilder()
             .interceptors().filterNot { it is CookieInterceptor }
             .let { OkHttpClient.Builder().apply { interceptors().addAll(it) } }
@@ -458,12 +512,11 @@ class Jinmantiantang :
         return cookies.joinToString("; ")
     }
 
-    // 更新开关的 summary 显示登录状态
     private fun updateSwitchSummary(switchPref: SwitchPreferenceCompat) {
         val isLoginEnabled = switchPref.isChecked
         val cookies = preferences.getString(COOKIE_PREF, "")
         val username = getUsername()
-        val favoriteUrl = "/user/$username/favorite/albums?"
+        val favoriteUrl = "/user/$username/favorite/albums"
 
         val summary = if (isLoginEnabled && !cookies.isNullOrEmpty()) {
             val cookieDisplay = if (cookies.length > 16) {
@@ -480,14 +533,13 @@ class Jinmantiantang :
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val context = screen.context
-        
+
         EditTextPreference(context).apply {
             key = USERNAME_PREF
             title = "用户名"
             summary = "用于登录禁漫天堂"
             setDefaultValue("")
             setOnPreferenceChangeListener { _, _ ->
-                // 用户名改变时，如果开关是开启状态，则清除旧 Cookie，提示重新登录
                 if (preferences.getBoolean(ENABLE_LOGIN_PREF, false)) {
                     preferences.edit().remove(COOKIE_PREF).apply()
                     Toast.makeText(context, "用户名已更改，请重新开启登录开关", Toast.LENGTH_SHORT).show()
@@ -495,11 +547,11 @@ class Jinmantiantang :
                 true
             }
         }.let(screen::addPreference)
-        
+
         EditTextPreference(context).apply {
             key = PASSWORD_PREF
             title = "密码"
-            summary = "仅用于登录获取 Cookie"
+            summary = "密码不会明文存储，仅用于登录获取Cookie"
             setDefaultValue("")
             setOnPreferenceChangeListener { _, _ ->
                 if (preferences.getBoolean(ENABLE_LOGIN_PREF, false)) {
@@ -510,61 +562,49 @@ class Jinmantiantang :
             }
         }.let(screen::addPreference)
 
-        // 启用登录状态的开关
         val switchLogin = SwitchPreferenceCompat(context).apply {
             key = ENABLE_LOGIN_PREF
             title = "启用登入状态浏览"
             setDefaultValue(false)
         }
         screen.addPreference(switchLogin)
-
-        // 初始化 summary
         updateSwitchSummary(switchLogin)
 
-        // 监听开关变化
         switchLogin.setOnPreferenceChangeListener { _, newValue ->
             val isEnable = newValue as Boolean
             if (isEnable) {
-                // 开启开关：尝试登录
                 val username = preferences.getString(USERNAME_PREF, "")!!
                 val password = preferences.getString(PASSWORD_PREF, "")!!
                 if (username.isBlank() || password.isBlank()) {
                     Toast.makeText(context, "请先填写用户名和密码", Toast.LENGTH_LONG).show()
-                    // 保持开关关闭
                     return@setOnPreferenceChangeListener false
                 }
-                // 在后台线程登录，避免阻塞 UI
                 Thread {
                     val cookies = performLogin(username, password)
                     if (cookies != null) {
                         preferences.edit().putString(COOKIE_PREF, cookies).apply()
-                        // 更新 UI 显示
                         (context as? android.app.Activity)?.runOnUiThread {
                             updateSwitchSummary(switchLogin)
                             Toast.makeText(context, "登录成功", Toast.LENGTH_SHORT).show()
                         }
-                        // 开关保持开启
                         (switchLogin as SwitchPreferenceCompat).isChecked = true
                     } else {
                         (context as? android.app.Activity)?.runOnUiThread {
                             Toast.makeText(context, "登录失败，请检查用户名和密码", Toast.LENGTH_LONG).show()
                             updateSwitchSummary(switchLogin)
                         }
-                        // 登录失败，回滚开关状态
                         (switchLogin as SwitchPreferenceCompat).isChecked = false
                     }
                 }.start()
-                // 返回 true 表示接受状态变化（实际状态会在登录成功后设置，这里先允许变化再异步修正）
                 true
             } else {
-                // 关闭开关：清除 Cookie
                 preferences.edit().remove(COOKIE_PREF).apply()
                 updateSwitchSummary(switchLogin)
                 Toast.makeText(context, "已退出登录", Toast.LENGTH_SHORT).show()
                 true
             }
         }
-        
+
         getPreferenceList(context, preferences, updateUrlInterceptor.isUpdated).forEach(screen::addPreference)
         screen.addRandomUAPreference()
     }
