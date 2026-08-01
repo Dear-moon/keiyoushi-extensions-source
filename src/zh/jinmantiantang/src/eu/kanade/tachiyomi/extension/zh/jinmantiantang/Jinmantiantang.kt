@@ -1,10 +1,17 @@
 package eu.kanade.tachiyomi.extension.zh.jinmantiantang
 
+import android.app.Application
+import android.os.Handler
+import android.os.Looper
 import android.util.Base64
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.asObservableSuccess
 import eu.kanade.tachiyomi.source.ConfigurableSource
+import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
@@ -26,8 +33,11 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.jsoup.select.Elements
 import rx.Observable
+import uy.kohesive.injekt.Injekt
+import uy.kohesive.injekt.api.get
 import java.text.SimpleDateFormat
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.time.Duration.Companion.seconds
 
 @Source
@@ -111,6 +121,10 @@ abstract class Jinmantiantang :
     }
 
     override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
+        val favoritesFilter = filters.filterIsInstance<FavoritesFilter>().firstOrNull()
+        if (favoritesFilter?.isEnabled() == true) {
+            return fetchFavorites(page)
+        }
         if (query.startsWith("https://")) {
             val url = query.toHttpUrl()
             if (url.host != baseUrl.toHttpUrl().host) {
@@ -158,6 +172,122 @@ abstract class Jinmantiantang :
     }
 
     override fun searchMangaParse(response: Response): MangasPage = popularMangaParse(response)
+
+    // 收藏夹
+    private fun fetchFavorites(page: Int): Observable<MangasPage> {
+        val cached = getUsername()
+        if (cached.isNotBlank()) {
+            return favoritesObservable(page, cached)
+        }
+        return detectUsername().flatMap { detected ->
+            if (detected.isBlank()) {
+                Observable.error(Exception("未检测到登录状态：请在应用内置浏览器中打开网页并登录，或在插件设置中手动填写用户名"))
+            } else {
+                preferences.edit().putString(USERNAME_PREF, detected).apply()
+                favoritesObservable(page, detected)
+            }
+        }
+    }
+
+    private fun favoritesObservable(page: Int, username: String): Observable<MangasPage> = client.newCall(favoritesRequest(page, username))
+        .asObservableSuccess()
+        .map { response -> favoritesParse(response) }
+
+    private fun favoritesRequest(page: Int, username: String): Request = GET("$baseUrl/user/$username/favorite/albums?page=$page", headers)
+
+    private fun favoritesParse(response: Response): MangasPage {
+        val document = response.asJsoup()
+        val mangas = document.select(FAVORITE_MANGA_SELECTOR).map { favoriteMangaFromElement(it) }
+        val hasNextPage = document.selectFirst("a.prevnext") != null
+        return MangasPage(mangas, hasNextPage)
+    }
+
+    private fun favoriteMangaFromElement(element: Element): SManga = SManga.create().apply {
+        val link = element.selectFirst("a[href*='/album/']")
+        if (link != null) {
+            setUrlWithoutDomain(link.attr("href").substringBefore("?"))
+            title = element.selectFirst(".video-title")?.text()?.trim() ?: "Unknown"
+            val img = element.selectFirst(".thumb-overlay img")
+            thumbnail_url = if (img != null) img.extractThumbnailUrl().substringBeforeLast('?') else ""
+        } else {
+            title = "Unknown"
+        }
+    }
+
+    // 用户名获取
+    private fun getUsername(): String = preferences.getString(USERNAME_PREF, "")?.trim() ?: ""
+
+    private val detectionInFlight = AtomicBoolean(false)
+
+    private fun triggerUsernameDetection() {
+        if (getUsername().isNotBlank()) return
+        if (!detectionInFlight.compareAndSet(false, true)) return
+        detectUsername().subscribe(
+            { detected ->
+                detectionInFlight.set(false)
+                if (detected.isNotBlank()) {
+                    preferences.edit().putString(USERNAME_PREF, detected).apply()
+                }
+            },
+            { detectionInFlight.set(false) },
+        )
+    }
+
+    private fun detectUsername(): Observable<String> = Observable.create { subscriber ->
+        val mainHandler = Handler(Looper.getMainLooper())
+        mainHandler.post {
+            val context = Injekt.get<Application>()
+            val webView = WebView(context)
+            webView.settings.javaScriptEnabled = true
+            webView.settings.domStorageEnabled = true
+            webView.settings.databaseEnabled = true
+
+            var done = false
+            val finish: (String?) -> Unit = { result ->
+                if (!done) {
+                    done = true
+                    mainHandler.removeCallbacksAndMessages(null)
+                    webView.stopLoading()
+                    webView.destroy()
+                    if (!subscriber.isUnsubscribed) {
+                        subscriber.onNext(result ?: "")
+                        subscriber.onCompleted()
+                    }
+                }
+            }
+            val timeout = Runnable { finish(null) }
+
+            webView.webViewClient = object : WebViewClient() {
+                override fun onPageFinished(view: WebView, url: String?) {
+                    view.evaluateJavascript(USERNAME_EXTRACTION_JS) { value ->
+                        val result = parseJsString(value)
+                        if (result != null) {
+                            finish(result)
+                        } else if (url != null && url.contains("challenge", ignoreCase = true)) {
+                            // 等待 Cloudflare 验证自动通过
+                        } else {
+                            finish(null)
+                        }
+                    }
+                }
+            }
+
+            mainHandler.postDelayed(timeout, DETECTION_TIMEOUT)
+            webView.loadUrl(baseUrl)
+        }
+    }
+
+    private fun parseJsString(value: String?): String? {
+        if (value.isNullOrBlank() || value.trim() == "null") return null
+        val trimmed = value.trim()
+        return if (trimmed.length >= 2 && trimmed.startsWith("\"") && trimmed.endsWith("\"")) {
+            trimmed.substring(1, trimmed.length - 1)
+                .replace("\\\"", "\"")
+                .replace("\\\\", "\\")
+        } else {
+            trimmed
+        }
+    }
 
     // 漫画详情
     private fun mangaDetailsResolve(response: Response): Document {
@@ -295,20 +425,57 @@ abstract class Jinmantiantang :
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
 
     // Filters
-    override fun getFilterList() = FilterList(
-        CategoryGroup(),
-        SortFilter(),
-        TimeFilter(),
-        TypeFilter(),
-    )
+    override fun getFilterList(): FilterList {
+        triggerUsernameDetection()
+        return FilterList(
+            FavoritesFilter(),
+            Filter.Separator(),
+            CategoryGroup(),
+            SortFilter(),
+            TimeFilter(),
+            TypeFilter(),
+        )
+    }
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        getPreferenceList(screen.context, preferences, updateUrlInterceptor.isUpdated).forEach(screen::addPreference)
+        val context = screen.context
+
+        EditTextPreference(context).apply {
+            key = USERNAME_PREF
+            title = "用户名（用于收藏夹）"
+            summary = "在浏览本图源时，用应用内置浏览器打开网页并登录账号，登录态会自动同步到插件（无需填写密码）。\n" +
+                "留空时插件会尝试从登录状态自动识别用户名；识别失败时请在此手动填写（顶栏账号即用户名）。"
+            setDefaultValue("")
+        }.let(screen::addPreference)
+
+        getPreferenceList(context, preferences, updateUrlInterceptor.isUpdated).forEach(screen::addPreference)
         screen.addRandomUAPreference()
     }
 
     companion object {
         private const val PREFIX_ID_SEARCH_NO_COLON = "JM"
         const val PREFIX_ID_SEARCH = "$PREFIX_ID_SEARCH_NO_COLON:"
+
+        private const val USERNAME_PREF = "username"
+        private const val DETECTION_TIMEOUT = 30_000L
+        private const val FAVORITE_MANGA_SELECTOR = "div[id^='favorites_album_']"
+
+        private val USERNAME_EXTRACTION_JS = """
+            (function() {
+                function extract(scope) {
+                    var links = scope.querySelectorAll('a[href*="favorite"]');
+                    for (var i = 0; i < links.length; i++) {
+                        var href = links[i].getAttribute('href') || '';
+                        var parts = href.split('/');
+                        var ui = parts.indexOf('user');
+                        if (ui >= 0 && parts[ui + 1] && parts[ui + 1].length > 0) return parts[ui + 1];
+                    }
+                    return null;
+                }
+                var nav = document.querySelector('#Comic_Top_Nav');
+                if (nav) { var u = extract(nav); if (u) return u; }
+                return extract(document);
+            })()
+        """.trimIndent()
     }
 }
