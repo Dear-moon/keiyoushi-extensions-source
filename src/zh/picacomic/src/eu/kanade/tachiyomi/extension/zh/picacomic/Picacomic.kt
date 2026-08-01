@@ -20,7 +20,9 @@ import keiyoushi.utils.getPreferences
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.json.jsonObject
 import okhttp3.Headers
 import okhttp3.Headers.Companion.toHeaders
 import okhttp3.MediaType.Companion.toMediaType
@@ -200,15 +202,24 @@ abstract class Picacomic :
         var sort: String? = null
         var category: String? = null
         var rankPath: String? = null
+        var favourites = false
 
         // parse filters
         for (filter in filters) {
             when (filter) {
+                is FavoritesFilter -> favourites = filter.isEnabled()
                 is SortFilter -> sort = filter.toUriPart()
                 is CategoryFilter -> category = filter.toUriPart()
                 is RankFilter -> rankPath = filter.toUriPart()
+                is Filter.Separator, is Filter.Header -> {}
                 else -> throw Exception("unknown filter found")
             }
+        }
+
+        // return comics from user's favourites
+        if (favourites) {
+            val url = "$baseUrl/users/favourite?page=$page&s=${sort ?: "dd"}"
+            return GET(url, picaHeaders(url))
         }
 
         // return comics from leaderboard
@@ -246,9 +257,9 @@ abstract class Picacomic :
             return singlePageParse(response)
         }
 
-        val comics = json.decodeFromString<PicaResponse>(
-            response.body.string(),
-        ).data.comics!!.let { json.decodeFromJsonElement<PicaSearchComics>(it) }
+        val root = json.decodeFromString<JsonObject>(response.body.string())
+        val data = root.getValue("data").jsonObject
+        val comics = json.decodeFromJsonElement<PicaSearchComics>(data["comics"] ?: data)
 
         val mangas = comics.docs
             .filter { !hitBlocklist(it) }
@@ -353,10 +364,16 @@ abstract class Picacomic :
     }
 
     override fun getFilterList() = FilterList(
+        FavoritesFilter(),
+        Filter.Separator(),
         SortFilter(),
         CategoryFilter(),
         RankFilter(),
     )
+
+    private class FavoritesFilter : Filter.Select<String>("收藏夹", arrayOf("关闭", "启用"), 0) {
+        fun isEnabled() = state == 1
+    }
 
     private class SortFilter :
         UriPartFilter(
