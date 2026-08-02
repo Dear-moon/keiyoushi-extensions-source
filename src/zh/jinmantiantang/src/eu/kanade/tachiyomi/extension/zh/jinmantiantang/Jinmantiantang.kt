@@ -198,6 +198,13 @@ abstract class Jinmantiantang :
     private fun favoritesParse(response: Response): MangasPage {
         val document = response.asJsoup()
         val mangas = document.select(FAVORITE_MANGA_SELECTOR).map { favoriteMangaFromElement(it) }
+        if (mangas.isEmpty()) {
+            val nav = document.selectFirst("#Comic_Top_Nav")
+            val loggedIn = nav?.selectFirst("a[href*='favorite'], a[href*='logout']") != null
+            if (!loggedIn) {
+                throw Exception("登录已过期，请重新在应用内置浏览器中登录")
+            }
+        }
         val hasNextPage = document.selectFirst("a.prevnext") != null
         return MangasPage(mangas, hasNextPage)
     }
@@ -208,7 +215,16 @@ abstract class Jinmantiantang :
             setUrlWithoutDomain(link.attr("href").substringBefore("?"))
             title = element.selectFirst(".video-title")?.text()?.trim() ?: "Unknown"
             val img = element.selectFirst(".thumb-overlay img")
-            thumbnail_url = if (img != null) img.extractThumbnailUrl().substringBeforeLast('?') else ""
+            thumbnail_url = if (img != null) {
+                when {
+                    img.hasAttr("data-original") -> img.absUrl("data-original")
+                    img.hasAttr("src") -> img.absUrl("src")
+                    img.hasAttr("data-cfsrc") -> img.absUrl("data-cfsrc")
+                    else -> ""
+                }.substringBeforeLast('?')
+            } else {
+                ""
+            }
         } else {
             title = "Unknown"
         }
