@@ -19,6 +19,7 @@ data class PicaSearchPayload(
 @Serializable
 data class PicaResponse(
     val data: PicaData,
+    val message: String? = null,
 )
 
 @Serializable
@@ -40,6 +41,9 @@ data class PicaData(
     val token: String? = null,
     // /comics/comicId
     val comic: PicaSearchComic? = null,
+    // /users/punch-in
+    val punchInLastDay: String? = null,
+    val status: String? = null,
 )
 
 // /comics
