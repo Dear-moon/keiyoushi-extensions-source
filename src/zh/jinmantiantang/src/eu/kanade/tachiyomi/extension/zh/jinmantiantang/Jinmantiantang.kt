@@ -6,9 +6,12 @@ import android.os.Looper
 import android.util.Base64
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
+import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.asObservableSuccess
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.Filter
@@ -25,6 +28,7 @@ import keiyoushi.lib.randomua.setRandomUserAgent
 import keiyoushi.network.rateLimit
 import keiyoushi.utils.getPreferences
 import keiyoushi.utils.tryParse
+import okhttp3.FormBody
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -36,6 +40,7 @@ import rx.Observable
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.time.Duration.Companion.seconds
@@ -69,6 +74,11 @@ abstract class Jinmantiantang :
     override fun headersBuilder() = super.headersBuilder()
         .set("Referer", "$baseUrl/")
         .setRandomUserAgent()
+
+    override fun fetchPopularManga(page: Int): Observable<MangasPage> {
+        maybeAutoCheckIn()
+        return super.fetchPopularManga(page)
+    }
 
     // 点击量排序(人气)
     override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/albums?o=mv&page=$page", headers)
@@ -453,6 +463,54 @@ abstract class Jinmantiantang :
         )
     }
 
+    // 签到
+    private class AlreadyCheckedInException : Exception()
+
+    private fun maybeAutoCheckIn() {
+        if (!preferences.getBoolean(CHECKIN_PREF, false)) return
+        if (preferences.getString(CHECKIN_DATE_PREF, "") == today()) return
+        Thread {
+            try {
+                val msg = performCheckIn()
+                preferences.edit().putString(CHECKIN_DATE_PREF, today()).apply()
+                showToast("签到成功：$msg")
+            } catch (_: AlreadyCheckedInException) {
+                preferences.edit().putString(CHECKIN_DATE_PREF, today()).apply()
+            } catch (_: Exception) {
+            }
+        }.start()
+    }
+
+    private fun performCheckIn(): String {
+        val homepage = client.newCall(GET("$baseUrl/", headers)).execute().asJsoup()
+        val dailyId = homepage.selectFirst("#bouns-popup")?.attr("data-dailyid")
+            ?: throw Exception("未找到签到入口，请先在应用内置浏览器中登录")
+        val eventJson = client.newCall(
+            GET("$baseUrl/ajax/user_daily_event?daily_id=$dailyId", headers),
+        ).execute().body.string()
+        val oldStep = Regex("\"oldStep\":(\\d+)").find(eventJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+        val form = FormBody.Builder()
+            .add("daily_id", dailyId)
+            .add("oldStep", (oldStep + 1).toString())
+            .build()
+        val signJson = client.newCall(
+            POST("$baseUrl/ajax/user_daily_sign", headers, form),
+        ).execute().body.string()
+        val error = Regex("\"error\":\"([^\"]*)\"").find(signJson)?.groupValues?.get(1)
+        if (error == "finished") throw AlreadyCheckedInException()
+        if (error != null) throw Exception("签到失败：$error")
+        return Regex("\"msg\":\"([^\"]*)\"").find(signJson)?.groupValues?.get(1) ?: "签到成功"
+    }
+
+    private fun showToast(message: String) {
+        val context = Injekt.get<Application>()
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun today(): String = SimpleDateFormat("yyyy-MM-dd", Locale.ENGLISH).format(Date())
+
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val context = screen.context
 
@@ -462,6 +520,32 @@ abstract class Jinmantiantang :
             summary = "在浏览本图源时，用应用内置浏览器打开网页并登录账号，登录态会自动同步到插件（无需填写密码）。\n" +
                 "留空时插件会尝试从登录状态自动识别用户名；识别失败时请在此手动填写（顶栏账号即用户名）。"
             setDefaultValue("")
+        }.let(screen::addPreference)
+
+        SwitchPreferenceCompat(context).apply {
+            key = CHECKIN_PREF
+            title = "自动签到"
+            summary = "每次打开本图源时自动进行每日签到"
+            setDefaultValue(false)
+        }.let(screen::addPreference)
+
+        SwitchPreferenceCompat(context).apply {
+            title = "立即签到"
+            summary = "点击立即签到一次"
+            setOnPreferenceChangeListener { _, _ ->
+                Thread {
+                    try {
+                        val msg = performCheckIn()
+                        preferences.edit().putString(CHECKIN_DATE_PREF, today()).apply()
+                        showToast("签到成功：$msg")
+                    } catch (_: AlreadyCheckedInException) {
+                        showToast("今日已签到")
+                    } catch (e: Exception) {
+                        showToast("签到失败：${e.message}")
+                    }
+                }.start()
+                false
+            }
         }.let(screen::addPreference)
 
         getPreferenceList(context, preferences, updateUrlInterceptor.isUpdated).forEach(screen::addPreference)
@@ -475,6 +559,8 @@ abstract class Jinmantiantang :
         private const val USERNAME_PREF = "username"
         private const val DETECTION_TIMEOUT = 30_000L
         private const val FAVORITE_MANGA_SELECTOR = "div[id^='favorites_album_']"
+        private const val CHECKIN_PREF = "auto_checkin"
+        private const val CHECKIN_DATE_PREF = "last_checkin_date"
 
         private val USERNAME_EXTRACTION_JS = """
             (function() {
