@@ -40,7 +40,7 @@ import rx.Observable
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.text.SimpleDateFormat
-import java.util.Date
+import java.time.LocalDate
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.time.Duration.Companion.seconds
@@ -583,7 +583,7 @@ abstract class Jinmantiantang :
         }
     }
 
-    private fun today(): String = SimpleDateFormat("yyyy-MM-dd", Locale.ENGLISH).format(Date())
+    private fun today(): String = LocalDate.now().toString()
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val context = screen.context

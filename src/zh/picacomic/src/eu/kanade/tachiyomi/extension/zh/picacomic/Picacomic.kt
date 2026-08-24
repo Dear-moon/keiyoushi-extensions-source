@@ -40,6 +40,7 @@ import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
+import java.time.LocalDate
 import java.util.Date
 import java.util.Locale
 import kotlin.math.floor
@@ -472,7 +473,7 @@ abstract class Picacomic :
         }
     }
 
-    private fun today(): String = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
+    private fun today(): String = LocalDate.now().toString()
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val context = screen.context
