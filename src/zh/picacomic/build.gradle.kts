@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Picacomic"
-    versionCode = 8
+    versionCode = 9
     contentWarning = ContentWarning.NSFW // or MIXED, please confirm
     libVersion = "1.4"
 

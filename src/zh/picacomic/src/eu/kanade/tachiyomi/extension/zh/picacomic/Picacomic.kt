@@ -1,10 +1,15 @@
 package eu.kanade.tachiyomi.extension.zh.picacomic
 
+import android.app.Application
 import android.content.SharedPreferences
+import android.os.Handler
+import android.os.Looper
 import android.util.Base64
+import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
+import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.source.ConfigurableSource
@@ -20,7 +25,9 @@ import keiyoushi.utils.getPreferences
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.json.jsonObject
 import okhttp3.Headers
 import okhttp3.Headers.Companion.toHeaders
 import okhttp3.MediaType.Companion.toMediaType
@@ -28,6 +35,9 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import rx.Observable
+import uy.kohesive.injekt.Injekt
+import uy.kohesive.injekt.api.get
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -160,6 +170,11 @@ abstract class Picacomic :
         return json.decodeFromString<PicaResponse>(response.body.string()).data.token!!
     }
 
+    override fun fetchPopularManga(page: Int): Observable<MangasPage> {
+        maybeAutoCheckIn()
+        return super.fetchPopularManga(page)
+    }
+
     override fun popularMangaRequest(page: Int): Request {
         val url = "$baseUrl/comics?page=$page&s=dd"
         return GET(url, picaHeaders(url))
@@ -200,15 +215,24 @@ abstract class Picacomic :
         var sort: String? = null
         var category: String? = null
         var rankPath: String? = null
+        var favourites = false
 
         // parse filters
         for (filter in filters) {
             when (filter) {
+                is FavoritesFilter -> favourites = filter.isEnabled()
                 is SortFilter -> sort = filter.toUriPart()
                 is CategoryFilter -> category = filter.toUriPart()
                 is RankFilter -> rankPath = filter.toUriPart()
+                is Filter.Separator, is Filter.Header -> {}
                 else -> throw Exception("unknown filter found")
             }
+        }
+
+        // return comics from user's favourites
+        if (favourites) {
+            val url = "$baseUrl/users/favourite?page=$page&s=${sort ?: "dd"}"
+            return GET(url, picaHeaders(url))
         }
 
         // return comics from leaderboard
@@ -246,9 +270,9 @@ abstract class Picacomic :
             return singlePageParse(response)
         }
 
-        val comics = json.decodeFromString<PicaResponse>(
-            response.body.string(),
-        ).data.comics!!.let { json.decodeFromJsonElement<PicaSearchComics>(it) }
+        val root = json.decodeFromString<JsonObject>(response.body.string())
+        val data = root.getValue("data").jsonObject
+        val comics = json.decodeFromJsonElement<PicaSearchComics>(data["comics"] ?: data)
 
         val mangas = comics.docs
             .filter { !hitBlocklist(it) }
@@ -353,10 +377,16 @@ abstract class Picacomic :
     }
 
     override fun getFilterList() = FilterList(
+        FavoritesFilter(),
+        Filter.Separator(),
         SortFilter(),
         CategoryFilter(),
         RankFilter(),
     )
+
+    private class FavoritesFilter : Filter.Select<String>("收藏夹", arrayOf("关闭", "启用"), 0) {
+        fun isEnabled() = state == 1
+    }
 
     private class SortFilter :
         UriPartFilter(
@@ -403,8 +433,77 @@ abstract class Picacomic :
         open fun toUriPart() = vals[state].second
     }
 
+    // 签到
+    private class AlreadyCheckedInException : Exception()
+
+    private fun maybeAutoCheckIn() {
+        if (!preferences.getBoolean(CHECKIN_PREF, false)) return
+        if (preferences.getString(CHECKIN_DATE_PREF, "") == today()) return
+        Thread {
+            try {
+                val msg = performCheckIn()
+                preferences.edit().putString(CHECKIN_DATE_PREF, today()).apply()
+                showToast("签到成功：$msg")
+            } catch (_: AlreadyCheckedInException) {
+                preferences.edit().putString(CHECKIN_DATE_PREF, today()).apply()
+            } catch (_: Exception) {
+            }
+        }.start()
+    }
+
+    private fun performCheckIn(): String {
+        val url = "$baseUrl/users/punch-in"
+        val body = "{}".toRequestBody("application/json; charset=UTF-8".toMediaType())
+        val response = client.newCall(POST(url, picaHeaders(url, "POST"), body)).execute()
+        if (!response.isSuccessful) {
+            throw Exception("签到请求失败")
+        }
+        val parsed = json.decodeFromString<PicaResponse>(response.body.string())
+        if (parsed.data.status != "ok") {
+            throw AlreadyCheckedInException()
+        }
+        return parsed.message?.takeIf { it.isNotBlank() } ?: "签到成功"
+    }
+
+    private fun showToast(message: String) {
+        val context = Injekt.get<Application>()
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun today(): String = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
+
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        EditTextPreference(screen.context).apply {
+        val context = screen.context
+
+        SwitchPreferenceCompat(context).apply {
+            key = CHECKIN_PREF
+            title = "自动签到"
+            summary = "每次打开本图源时自动进行每日签到"
+            setDefaultValue(false)
+        }.let(screen::addPreference)
+
+        SwitchPreferenceCompat(context).apply {
+            title = "立即签到"
+            summary = "点击立即签到一次"
+            setOnPreferenceChangeListener { _, _ ->
+                Thread {
+                    try {
+                        val msg = performCheckIn()
+                        preferences.edit().putString(CHECKIN_DATE_PREF, today()).apply()
+                        showToast("签到成功：$msg")
+                    } catch (_: AlreadyCheckedInException) {
+                        showToast("今日已签到")
+                    } catch (e: Exception) {
+                        showToast("签到失败：${e.message}")
+                    }
+                }.start()
+                false
+            }
+        }.let(screen::addPreference)
+
+        EditTextPreference(context).apply {
             key = "USERNAME"
             title = "用户名"
             setOnPreferenceChangeListener { _, newValue ->
@@ -471,3 +570,5 @@ abstract class Picacomic :
 
 const val APP_CHANNEL = "APP_CHANNEL"
 const val APP_CHANNEL_URL = "APP_CHANNEL_URL"
+private const val CHECKIN_PREF = "auto_checkin"
+private const val CHECKIN_DATE_PREF = "last_checkin_date"
