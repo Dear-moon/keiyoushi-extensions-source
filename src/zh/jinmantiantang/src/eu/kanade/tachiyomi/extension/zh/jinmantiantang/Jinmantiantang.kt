@@ -43,6 +43,7 @@ import java.text.SimpleDateFormat
 import java.time.LocalDate
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.time.Duration.Companion.seconds
 
 @Source
@@ -208,15 +209,31 @@ abstract class Jinmantiantang :
     private fun favoritesParse(response: Response): MangasPage {
         val document = response.asJsoup()
         val mangas = document.select(FAVORITE_MANGA_SELECTOR).map { favoriteMangaFromElement(it) }
-        if (mangas.isEmpty()) {
-            val nav = document.selectFirst("#Comic_Top_Nav")
-            val loggedIn = nav?.selectFirst("a[href*='favorite'], a[href*='logout']") != null
-            if (!loggedIn) {
-                throw Exception("登录已过期，请重新在应用内置浏览器中登录")
-            }
+        if (mangas.isEmpty() && !document.isLoggedIn()) {
+            throw Exception("登录已过期，请重新在应用内置浏览器中登录")
         }
         val hasNextPage = document.selectFirst("a.prevnext") != null
         return MangasPage(mangas, hasNextPage)
+    }
+
+    // 登录守卫：站点对未登录请求返回登录页，直接解析会得到空标题/空章节并写回书架，
+    // 因此详情与章节请求在未登录时必须阻断。
+    private val lastLoginNoticeAt = AtomicLong(0)
+
+    private fun Document.isLoggedIn(): Boolean = selectFirst("#Comic_Top_Nav")?.selectFirst("a[href*='favorite'], a[href*='logout']") != null
+
+    private fun requireLoggedIn(document: Document) {
+        if (document.isLoggedIn()) return
+        notifyLoginBlocked()
+        throw Exception("未登录或登录已过期，已阻断请求以保护书架数据")
+    }
+
+    private fun notifyLoginBlocked() {
+        val now = System.currentTimeMillis()
+        val last = lastLoginNoticeAt.get()
+        if (now - last < LOGIN_NOTICE_INTERVAL) return
+        if (!lastLoginNoticeAt.compareAndSet(last, now)) return
+        showToast("未登录，已阻断与站点的连接")
     }
 
     private fun favoriteMangaFromElement(element: Element): SManga = SManga.create().apply {
@@ -346,6 +363,7 @@ abstract class Jinmantiantang :
 
     override fun mangaDetailsParse(response: Response): SManga {
         val document = mangaDetailsResolve(response)
+        requireLoggedIn(document)
         return mangaDetailsParse(document)
     }
 
@@ -410,6 +428,7 @@ abstract class Jinmantiantang :
 
     override fun chapterListParse(response: Response): List<SChapter> {
         val document = mangaDetailsResolve(response)
+        requireLoggedIn(document)
         val elements = document.select("div[id=episode-block] a[href^=/photo/]")
         if (elements.isEmpty()) {
             val singleChapter = SChapter.create().apply {
@@ -635,6 +654,7 @@ abstract class Jinmantiantang :
         private const val FAVORITE_MANGA_SELECTOR = "div[id^='favorites_album_']"
         private const val CHECKIN_PREF = "auto_checkin"
         private const val CHECKIN_DATE_PREF = "last_checkin_date"
+        private const val LOGIN_NOTICE_INTERVAL = 5_000L
 
         private val USERNAME_EXTRACTION_JS = """
             (function() {
